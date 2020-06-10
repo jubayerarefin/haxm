@@ -368,13 +368,12 @@ int hax_get_capability(void *buf, int bufLeng, int *outLength)
         // Fast MMIO supported since API version 2
         cap->winfo = HAX_CAP_FASTMMIO;
         cap->winfo |= HAX_CAP_64BIT_RAMBLOCK;
-#ifdef CONFIG_HAX_EPT2
         cap->winfo |= HAX_CAP_64BIT_SETRAM;
         cap->winfo |= HAX_CAP_IMPLICIT_RAMBLOCK;
-#endif
         cap->winfo |= HAX_CAP_TUNNEL_PAGE;
         cap->winfo |= HAX_CAP_RAM_PROTECTION;
         cap->winfo |= HAX_CAP_DEBUG;
+        cap->winfo |= HAX_CAP_CPUID;
         if (cpu_data->vmx_info._ept_cap) {
             cap->winfo |= HAX_CAP_EPT;
         }
@@ -567,7 +566,10 @@ int hax_module_init(void)
         hax_clear_page(hax_cpu_data[cpu_id]->hstate.hfxpage);
         hax_cpu_data[cpu_id]->cpu_id = cpu_id;
     }
-    cpu_init_feature_cache();
+
+    cpuid_host_init();
+    cpuid_init_supported_features();
+
     if (hax_vmx_init() < 0)
         goto out_2;
 

@@ -123,6 +123,10 @@ static void vcpu_enter_fpu_state(struct vcpu_t *vcpu);
 static int vcpu_set_apic_base(struct vcpu_t *vcpu, uint64_t val);
 static bool vcpu_is_bsp(struct vcpu_t *vcpu);
 
+static void vcpu_init_cpuid(struct vcpu_t *vcpu);
+static int vcpu_alloc_cpuid(struct vcpu_t *vcpu);
+static void vcpu_free_cpuid(struct vcpu_t *vcpu);
+
 static uint32_t get_seg_present(uint32_t seg)
 {
     mword ldtr_base;
@@ -457,8 +461,11 @@ struct vcpu_t *vcpu_create(struct vm_t *vm, void *vm_host, int vcpu_id)
     if (!vcpu_vtlb_alloc(vcpu))
         goto fail_6;
 
-    if (hax_vcpu_create_host(vcpu, vm_host, vm->vm_id, vcpu_id))
+    if (!vcpu_alloc_cpuid(vcpu))
         goto fail_7;
+
+    if (hax_vcpu_create_host(vcpu, vm_host, vm->vm_id, vcpu_id))
+        goto fail_8;
 
     vcpu->prev_cpu_id = (uint32_t)(~0ULL);
     vcpu->cpu_id = hax_cpu_id();
@@ -488,6 +495,8 @@ struct vcpu_t *vcpu_create(struct vm_t *vm, void *vm_host, int vcpu_id)
 
     hax_log(HAX_LOGD, "vcpu %d is created.\n", vcpu->vcpu_id);
     return vcpu;
+fail_8:
+    vcpu_free_cpuid(vcpu);
 fail_7:
     vcpu_vtlb_free(vcpu);
 fail_6:
@@ -528,11 +537,9 @@ static int _vcpu_teardown(struct vcpu_t *vcpu)
 {
     int vcpu_id = vcpu->vcpu_id;
 
-#ifdef CONFIG_HAX_EPT2
     if (vcpu->mmio_fetch.kva) {
         gpa_space_unmap_page(&vcpu->vm->gpa_space, &vcpu->mmio_fetch.kmap);
     }
-#endif  // CONFIG_HAX_EPT2
 
     // TODO: we should call invvpid after calling vcpu_vpid_free().
     vcpu_vpid_free(vcpu);
@@ -544,6 +551,7 @@ static int _vcpu_teardown(struct vcpu_t *vcpu)
     hax_vfree(vcpu->state, sizeof(struct vcpu_state_t));
     vcpu_vtlb_free(vcpu);
     hax_mutex_free(vcpu->tmutex);
+    vcpu_free_cpuid(vcpu);
     hax_vfree(vcpu, sizeof(struct vcpu_t));
 
     hax_log(HAX_LOGI, "vcpu %d is teardown.\n", vcpu_id);
@@ -576,7 +584,6 @@ static void vcpu_init(struct vcpu_t *vcpu)
 
     // TODO: mtrr ?
     vcpu->cr_pat = 0x0007040600070406ULL;
-    vcpu->cpuid_features_flag_mask = 0xffffffffffffffffULL;
     vcpu->cur_state = GS_VALID;
     vmx(vcpu, entry_exception_vector) = ~0u;
     vmx(vcpu, cr0_mask) = 0;
@@ -631,6 +638,9 @@ static void vcpu_init(struct vcpu_t *vcpu)
     if (vcpu_is_bsp(vcpu)) {
         vcpu->gstate.apic_base |= APIC_BASE_BSP;
     }
+
+    // Initialize guest CPUID
+    vcpu_init_cpuid(vcpu);
 
     hax_mutex_unlock(vcpu->tmutex);
 }
@@ -1229,6 +1239,9 @@ void vcpu_save_host_state(struct vcpu_t *vcpu)
         vmwrite(vcpu, HOST_EFER, hstate->_efer);
     }
 
+    hstate->_pat = ia32_rdmsr(IA32_CR_PAT);
+    vmwrite(vcpu, HOST_PAT, hstate->_pat);
+
 #ifdef HAX_ARCH_X86_64
     vmwrite(vcpu, HOST_CS_SELECTOR, get_kernel_cs());
 #else
@@ -1395,15 +1408,15 @@ static void fill_common_vmcs(struct vcpu_t *vcpu)
 
 #ifdef HAX_ARCH_X86_64
     exit_ctls = EXIT_CONTROL_HOST_ADDR_SPACE_SIZE | EXIT_CONTROL_LOAD_EFER |
-                EXIT_CONTROL_SAVE_DEBUG_CONTROLS;
+                EXIT_CONTROL_SAVE_DEBUG_CONTROLS | EXIT_CONTROL_LOAD_PAT;
 #endif
 
 #ifdef HAX_ARCH_X86_32
     if (is_compatible()) {
         exit_ctls = EXIT_CONTROL_HOST_ADDR_SPACE_SIZE | EXIT_CONTROL_LOAD_EFER |
-                    EXIT_CONTROL_SAVE_DEBUG_CONTROLS;
+                    EXIT_CONTROL_SAVE_DEBUG_CONTROLS | EXIT_CONTROL_LOAD_PAT;
     } else {
-        exit_ctls = EXIT_CONTROL_SAVE_DEBUG_CONTROLS;
+        exit_ctls = EXIT_CONTROL_SAVE_DEBUG_CONTROLS | EXIT_CONTROL_LOAD_PAT;
     }
 #endif
 
@@ -1474,6 +1487,9 @@ static void fill_common_vmcs(struct vcpu_t *vcpu)
     if (exit_ctls & EXIT_CONTROL_LOAD_EFER) {
         vmwrite(vcpu, HOST_EFER, ia32_rdmsr(IA32_EFER));
     }
+
+    vmwrite(vcpu, HOST_PAT, ia32_rdmsr(IA32_CR_PAT));
+    vmwrite(vcpu, GUEST_PAT, vcpu->cr_pat);
 
     WRITE_CONTROLS(vcpu, VMX_ENTRY_CONTROLS, entry_ctls);
 
@@ -1898,7 +1914,6 @@ static int vcpu_prepare_pae_pdpt(struct vcpu_t *vcpu)
 {
     uint64_t cr3 = vcpu->state->_cr3;
     int pdpt_size = (int)sizeof(vcpu->pae_pdptes);
-#ifdef CONFIG_HAX_EPT2
     // CR3 is the GPA of the page-directory-pointer table. According to IASDM
     // Vol. 3A 4.4.1, Table 4-7, bits 63..32 and 4..0 of this GPA are ignored.
     uint64_t gpa = cr3 & 0xffffffe0;
@@ -1919,29 +1934,6 @@ static int vcpu_prepare_pae_pdpt(struct vcpu_t *vcpu)
     }
     vcpu->pae_pdpt_dirty = 1;
     return 0;
-#else // !CONFIG_HAX_EPT2
-    uint64_t gpfn = (cr3 & 0xfffff000) >> PG_ORDER_4K;
-    uint8_t *buf, *pdpt;
-#ifdef HAX_ARCH_X86_64
-    buf = hax_map_gpfn(vcpu->vm, gpfn);
-#else  // !HAX_ARCH_X86_64, i.e. HAX_ARCH_X86_32
-    buf = hax_map_gpfn(vcpu->vm, gpfn, false, cr3 & 0xfffff000, 1);
-#endif  // HAX_ARCH_X86_64
-    if (!buf) {
-        hax_log(HAX_LOGE, "%s: Failed to map guest page frame containing PAE "
-                "PDPT: cr3=0x%llx\n",  __func__, cr3);
-        return -ENOMEM;
-    }
-    pdpt = buf + (cr3 & 0xfe0);
-    memcpy_s(vcpu->pae_pdptes, pdpt_size, pdpt, pdpt_size);
-#ifdef HAX_ARCH_X86_64
-    hax_unmap_gpfn(buf);
-#else  // !HAX_ARCH_X86_64, i.e. HAX_ARCH_X86_32
-    hax_unmap_gpfn(vcpu->vm, buf, gpfn);
-#endif  // HAX_ARCH_X86_64
-    vcpu->pae_pdpt_dirty = 1;
-    return 0;
-#endif  // CONFIG_HAX_EPT2
 }
 
 static void vmwrite_cr(struct vcpu_t *vcpu)
@@ -2009,10 +2001,6 @@ static void vmwrite_cr(struct vcpu_t *vcpu)
         vmwrite(vcpu, GUEST_CR3, vtlb_get_cr3(vcpu));
         state->_efer = 0;
     } else {  // EPTE
-#ifndef CONFIG_HAX_EPT2
-        struct hax_ept *ept = vcpu->vm->ept;
-        ept->is_enabled = 1;
-#endif  // !CONFIG_HAX_EPT2
         vcpu->mmu->mmu_mode = MMU_MODE_EPT;
         // In EPT mode, we need to monitor guest writes to CR.PAE, so that we
         // know when it wants to enter PAE paging mode (see IASDM Vol. 3A 4.1.2,
@@ -2069,6 +2057,8 @@ static void vmwrite_cr(struct vcpu_t *vcpu)
     } else {
         entry_ctls &= ~ENTRY_CONTROL_LOAD_EFER;
     }
+
+    entry_ctls |= ENTRY_CONTROL_LOAD_PAT;
 
     if (pcpu_ctls != vmx(vcpu, pcpu_ctls)) {
         vmx(vcpu, pcpu_ctls) = pcpu_ctls;
@@ -2148,15 +2138,11 @@ static bool is_mmio_address(struct vcpu_t *vcpu, hax_paddr_t gpa)
         hpa = hax_gpfn_to_hpa(vcpu->vm, gpa >> HAX_PAGE_SHIFT);
         // hax_gpfn_to_hpa() assumes hpa == 0 is invalid
         return !hpa;
-    } else {
-#ifdef CONFIG_HAX_EPT2
-        hax_memslot *slot = memslot_find(&vcpu->vm->gpa_space,
-                                         gpa >> PG_ORDER_4K);
-        return !slot;
-#else  // !CONFIG_HAX_EPT2
-        return !ept_translate(vcpu, gpa, PG_ORDER_4K, &hpa);
-#endif  // CONFIG_HAX_EPT2
     }
+
+    hax_memslot *slot = memslot_find(&vcpu->vm->gpa_space, gpa >> PG_ORDER_4K);
+
+    return !slot;
 }
 
 static int vcpu_emulate_insn(struct vcpu_t *vcpu)
@@ -2187,7 +2173,6 @@ static int vcpu_emulate_insn(struct vcpu_t *vcpu)
     // Fetch the instruction at guest CS:IP = CS.Base + IP, omitting segment
     // limit and privilege checks
     va = (mode == EM_MODE_PROT64) ? rip : cs_base + rip;
-#ifdef CONFIG_HAX_EPT2
     if (mmio_fetch_instruction(vcpu, va, instr, INSTR_MAX_LEN)) {
         vcpu_set_panic(vcpu);
         hax_log(HAX_LOGPANIC, "%s: mmio_fetch_instruction() failed: vcpu_id=%u,"
@@ -2196,16 +2181,6 @@ static int vcpu_emulate_insn(struct vcpu_t *vcpu)
         dump_vmcs(vcpu);
         return -1;
     }
-#else  // !CONFIG_HAX_EPT2
-    if (!vcpu_read_guest_virtual(vcpu, va, &instr, INSTR_MAX_LEN, INSTR_MAX_LEN,
-                                 0)) {
-        vcpu_set_panic(vcpu);
-        hax_log(HAX_LOGPANIC, "Error reading instruction at 0x%llx for decoding"
-                " (CS:IP=0x%llx:0x%llx)\n", va, cs_base, rip);
-        dump_vmcs(vcpu);
-        return -1;
-    }
-#endif  // CONFIG_HAX_EPT2
 
     em_ctxt->rip = rip;
     rc = em_decode_insn(em_ctxt, instr);
@@ -2573,50 +2548,16 @@ static void handle_cpuid_virtual(struct vcpu_t *vcpu, uint32_t a, uint32_t c)
     uint32_t hw_family;
     uint32_t hw_model;
     uint8_t physical_address_size;
+    uint32_t cpuid_1_features_ecx, cpuid_1_features_edx,
+             cpuid_8000_0001_features_ecx, cpuid_8000_0001_features_edx;
 
-    static uint32_t cpuid_1_features_edx =
-            // pat is disabled!
-            FEATURE(FPU)        |
-            FEATURE(VME)        |
-            FEATURE(DE)         |
-            FEATURE(TSC)        |
-            FEATURE(MSR)        |
-            FEATURE(PAE)        |
-            FEATURE(MCE)        |
-            FEATURE(CX8)        |
-            FEATURE(APIC)       |
-            FEATURE(SEP)        |
-            FEATURE(MTRR)       |
-            FEATURE(PGE)        |
-            FEATURE(MCA)        |
-            FEATURE(CMOV)       |
-            FEATURE(CLFSH)      |
-            FEATURE(MMX)        |
-            FEATURE(FXSR)       |
-            FEATURE(SSE)        |
-            FEATURE(SSE2)       |
-            FEATURE(SS)         |
-            FEATURE(PSE)        |
-            FEATURE(HTT);
-
-    static uint32_t cpuid_1_features_ecx =
-            FEATURE(SSE3)       |
-            FEATURE(SSSE3)      |
-            FEATURE(SSE41)      |
-            FEATURE(SSE42)      |
-            FEATURE(CMPXCHG16B) |
-            FEATURE(MOVBE)      |
-            FEATURE(AESNI)      |
-            FEATURE(PCLMULQDQ)  |
-            FEATURE(POPCNT);
-
-    static uint32_t cpuid_8000_0001_features_edx =
-            FEATURE(NX)         |
-            FEATURE(SYSCALL)    |
-            FEATURE(RDTSCP)     |
-            FEATURE(EM64T);
-
-    static uint32_t cpuid_8000_0001_features_ecx = 0;
+    // To fully support CPUID instructions (opcode = 0F A2) by software, it is
+    // recommended to add opcode_table_0FA2[] in core/emulate.c to emulate
+    // (Refer to Intel SDM Vol. 2A 3.2 CPUID).
+    cpuid_get_guest_features(vcpu->guest_cpuid, &cpuid_1_features_ecx,
+                             &cpuid_1_features_edx,
+                             &cpuid_8000_0001_features_ecx,
+                             &cpuid_8000_0001_features_edx);
 
     switch (a) {
         case 0: {                       // Maximum Basic Information
@@ -2705,10 +2646,13 @@ static void handle_cpuid_virtual(struct vcpu_t *vcpu, uint32_t a, uint32_t c)
             state->_edx = 0x0c040844;
             return;
         }
-        case 3:                         // Reserved
+        case 3: {                       // Reserved
+            state->_eax = state->_ebx = state->_ecx = state->_edx = 0;
+            return;
+        }
         case 4: {                       // Deterministic Cache Parameters
             // [31:26] cores per package - 1
-            state->_eax = state->_ebx = state->_ecx = state->_edx = 0;
+            // Use host cache values.
             return;
         }
         case 5:                         // MONITOR/MWAIT
@@ -3488,7 +3432,7 @@ static int handle_msr_read(struct vcpu_t *vcpu, uint32_t msr, uint64_t *val)
             break;
         }
         case IA32_CPUID_FEATURE_MASK: {
-            *val = vcpu->cpuid_features_flag_mask;
+            cpuid_get_features_mask(vcpu->guest_cpuid, val);
             break;
         }
         case IA32_EBC_FREQUENCY_ID: {
@@ -3605,6 +3549,15 @@ static int misc_msr_write(struct vcpu_t *vcpu, uint32_t msr, uint64_t val)
     return 1;
 }
 
+static inline bool is_pat_valid(uint64_t val)
+{
+    if (val & 0xF8F8F8F8F8F8F8F8)
+        return false;
+
+    // 0, 1, 4, 5, 6, 7 are valid values.
+    return (val | ((val & 0x0202020202020202) << 1)) == val;
+}
+
 static int handle_msr_write(struct vcpu_t *vcpu, uint32_t msr, uint64_t val,
                             bool by_host)
 {
@@ -3631,7 +3584,7 @@ static int handle_msr_write(struct vcpu_t *vcpu, uint32_t msr, uint64_t val,
             break;
         }
         case IA32_CPUID_FEATURE_MASK: {
-            vcpu->cpuid_features_flag_mask = val;
+            cpuid_set_features_mask(vcpu->guest_cpuid, val);
             break;
         }
         case IA32_EFER: {
@@ -3763,7 +3716,15 @@ static int handle_msr_write(struct vcpu_t *vcpu, uint32_t msr, uint64_t val,
             break;
         }
         case IA32_CR_PAT: {
+            // Attempting to write an undefined memory type encoding into the
+            // PAT causes a general-protection (#GP) exception to be generated
+            if (!is_pat_valid(val)) {
+                r = 1;
+                break;
+            }
+
             vcpu->cr_pat = val;
+            vmwrite(vcpu, GUEST_PAT, vcpu->cr_pat);
             break;
         }
         case IA32_MTRR_DEF_TYPE: {
@@ -3831,12 +3792,9 @@ static int exit_ept_misconfiguration(struct vcpu_t *vcpu,
                                      struct hax_tunnel *htun)
 {
     hax_paddr_t gpa;
-#ifdef CONFIG_HAX_EPT2
     int ret;
-#endif  // CONFIG_HAX_EPT2
 
     htun->_exit_reason = vmx(vcpu, exit_reason).basic_reason;
-#ifdef CONFIG_HAX_EPT2
     gpa = vmx(vcpu, exit_gpa);
     ret = ept_handle_misconfiguration(&vcpu->vm->gpa_space, &vcpu->vm->ept_tree,
                                       gpa);
@@ -3844,7 +3802,6 @@ static int exit_ept_misconfiguration(struct vcpu_t *vcpu,
         // The misconfigured entries have been fixed
         return HAX_RESUME;
     }
-#endif  // CONFIG_HAX_EPT2
 
     vcpu_set_panic(vcpu);
     hax_log(HAX_LOGPANIC, "%s: Unexpected EPT misconfiguration: gpa=0x%llx\n",
@@ -3858,9 +3815,7 @@ static int exit_ept_violation(struct vcpu_t *vcpu, struct hax_tunnel *htun)
     exit_qualification_t *qual = &vmx(vcpu, exit_qualification);
     hax_paddr_t gpa;
     int ret = 0;
-#ifdef CONFIG_HAX_EPT2
     uint64_t fault_gfn;
-#endif
 
     htun->_exit_reason = vmx(vcpu, exit_reason).basic_reason;
 
@@ -3873,7 +3828,6 @@ static int exit_ept_violation(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 
     gpa = vmx(vcpu, exit_gpa);
 
-#ifdef CONFIG_HAX_EPT2
     ret = ept_handle_access_violation(&vcpu->vm->gpa_space, &vcpu->vm->ept_tree,
                                       *qual, gpa, &fault_gfn);
     if (ret == -EFAULT) {
@@ -3912,7 +3866,7 @@ static int exit_ept_violation(struct vcpu_t *vcpu, struct hax_tunnel *htun)
         return HAX_RESUME;
     }
     // ret == 0: The EPT violation is due to MMIO
-#endif
+
     return vcpu_emulate_insn(vcpu);
 }
 
@@ -4199,6 +4153,28 @@ int vcpu_get_msr(struct vcpu_t *vcpu, uint64_t entry, uint64_t *val)
 int vcpu_set_msr(struct vcpu_t *vcpu, uint64_t entry, uint64_t val)
 {
     return handle_msr_write(vcpu, entry, val, true);
+}
+
+int vcpu_set_cpuid(struct vcpu_t *vcpu, hax_cpuid *cpuid_info)
+{
+    hax_log(HAX_LOGI, "%s: vCPU #%u is setting guest CPUID.\n", __func__,
+            vcpu->vcpu_id);
+
+    if (cpuid_info->total == 0 || cpuid_info->total > HAX_MAX_CPUID_ENTRIES) {
+        hax_log(HAX_LOGW, "%s: No entry or exceeds maximum: total = %lu.\n",
+                __func__, cpuid_info->total);
+        return -EINVAL;
+    }
+
+    if (vcpu->is_running) {
+        hax_log(HAX_LOGW, "%s: Cannot set CPUID: vcpu->is_running = %llu.\n",
+                __func__, vcpu->is_running);
+        return -EFAULT;
+    }
+
+    cpuid_set_guest_features(vcpu->guest_cpuid, cpuid_info);
+
+    return 0;
 }
 
 void vcpu_debug(struct vcpu_t *vcpu, struct hax_debug_t *debug)
@@ -4519,4 +4495,61 @@ static bool vcpu_is_bsp(struct vcpu_t *vcpu)
 {
     // TODO: add an API to set bootstrap processor
     return (vcpu->vm->bsp_vcpu_id == vcpu->vcpu_id);
+}
+
+static void vcpu_init_cpuid(struct vcpu_t *vcpu)
+{
+    struct vcpu_t *vcpu_0;
+
+    if (vcpu->vcpu_id != 0) {
+        vcpu_0 = hax_get_vcpu(vcpu->vm->vm_id, 0, 0);
+        if (vcpu_0 == NULL) {
+            hax_log(HAX_LOGE, "%s: initializing vCPU #%u with exception as "
+                    "vCPU #0 is absent.\n", __func__, vcpu->vcpu_id);
+            return;
+        }
+        vcpu->guest_cpuid = vcpu_0->guest_cpuid;
+        hax_log(HAX_LOGI, "%s: referenced vcpu[%u].guest_cpuid to vcpu[%u].\n",
+                __func__, vcpu->vcpu_id, vcpu_0->vcpu_id);
+        return;
+    }
+
+    cpuid_guest_init(vcpu->guest_cpuid);
+    hax_log(HAX_LOGI, "%s: initialized vcpu[%u].guest_cpuid with default "
+            "feature set.\n", __func__, vcpu->vcpu_id);
+}
+
+static int vcpu_alloc_cpuid(struct vcpu_t *vcpu)
+{
+    // Only the first vCPU will allocate the CPUID memory, and other vCPUs will
+    // share this memory.
+    if (vcpu->vcpu_id != 0)
+        return 1;
+
+    vcpu->guest_cpuid = hax_vmalloc(sizeof(hax_cpuid_t), HAX_MEM_NONPAGE);
+    if (vcpu->guest_cpuid == NULL)
+        return 0;
+
+    return 1;
+}
+
+static void vcpu_free_cpuid(struct vcpu_t *vcpu)
+{
+    if (vcpu->vcpu_id != 0) {
+        vcpu->guest_cpuid = NULL;
+        hax_log(HAX_LOGI, "%s: dereferenced vcpu[%u].guest_cpuid from vcpu[0]."
+                "\n", __func__, vcpu->vcpu_id);
+        return;
+    }
+
+    if (vcpu->guest_cpuid == NULL) {
+        hax_log(HAX_LOGW, "%s: already freed vcpu[%u].guest_cpuid.\n",
+                __func__, vcpu->vcpu_id);
+        return;
+    }
+
+    hax_vfree(vcpu->guest_cpuid, sizeof(hax_cpuid_t));
+    vcpu->guest_cpuid = NULL;
+    hax_log(HAX_LOGI, "%s: freed vcpu[%u].guest_cpuid.\n", __func__,
+            vcpu->vcpu_id);
 }

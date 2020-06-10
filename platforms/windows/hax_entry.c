@@ -431,6 +431,19 @@ NTSTATUS HaxVcpuControl(PDEVICE_OBJECT DeviceObject,
             vcpu_debug(cvcpu, (struct hax_debug_t*)inBuf);
             break;
         }
+        case HAX_VCPU_IOCTL_SET_CPUID: {
+            hax_cpuid *cpuid = (hax_cpuid *)inBuf;
+            if (inBufLength < sizeof(hax_cpuid) || inBufLength <
+                    sizeof(hax_cpuid) + cpuid->total *
+                    sizeof(hax_cpuid_entry)) {
+                ret = STATUS_INVALID_PARAMETER;
+                goto done;
+            }
+            if (vcpu_set_cpuid(cvcpu, cpuid)) {
+                ret = STATUS_UNSUCCESSFUL;
+            }
+            break;
+        }
         default:
             hax_log(HAX_LOGE, "Unknow vcpu ioctl %lx\n",
                     irpSp->Parameters.DeviceIoControl.IoControlCode);
@@ -552,7 +565,6 @@ NTSTATUS HaxVmControl(PDEVICE_OBJECT DeviceObject, struct hax_vm_windows *ext,
             }
             break;
         }
-#ifdef CONFIG_HAX_EPT2
         case HAX_VM_IOCTL_SET_RAM2: {
             struct hax_set_ram_info2 *info;
             int res;
@@ -601,7 +613,6 @@ NTSTATUS HaxVmControl(PDEVICE_OBJECT DeviceObject, struct hax_vm_windows *ext,
             }
             break;
         }
-#endif
         case HAX_VM_IOCTL_NOTIFY_QEMU_VERSION: {
             struct hax_qemu_version *info;
 
